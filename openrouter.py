@@ -26,11 +26,41 @@ load_dotenv()
 _API_KEY = os.getenv("OPENROUTER_API_KEY")
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Alternative backends — models with these prefixes route directly, bypassing OpenRouter.
+_ALT_BACKENDS: dict[str, tuple[str, str, dict]] = {}  # prefix → (url, api_key, extra_payload)
+_groq_key = os.getenv("GROQ_API_KEY", "")
+if _groq_key:
+    _ALT_BACKENDS["groq/"] = (
+        "https://api.groq.com/openai/v1/chat/completions",
+        _groq_key,
+        {"reasoning_format": "hidden"},
+    )
+
+
+def _resolve_endpoint(model: str) -> tuple[str, dict, str, dict]:
+    """Return (api_url, headers, model_id, extra_payload) for the given model.
+
+    For alt backends, strips the routing prefix so the downstream API receives
+    the native model name (e.g. 'groq/qwen/qwen3-32b' → 'qwen/qwen3-32b').
+    """
+    for prefix, (url, key, extra) in _ALT_BACKENDS.items():
+        if model and model.startswith(prefix):
+            native_id = model[len(prefix):]
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            return url, headers, native_id, extra
+    # Default: OpenRouter
+    headers = {"Authorization": f"Bearer {_API_KEY}", "Content-Type": "application/json"}
+    return _API_URL, headers, model, {}
+
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "google/gemini-2.5-flash-lite")
 NOTES_MODEL = os.getenv("NOTES_MODEL", DEFAULT_MODEL)
 SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL", DEFAULT_MODEL)
 COMPLEX_MODEL = os.getenv("COMPLEX_MODEL", SUMMARIZATION_MODEL)
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "")
+# ROUTING_MODEL: cheap/fast model for LLM-based execution mode classification (router.py).
+# Groq-prefixed models route directly to Groq API (requires GROQ_API_KEY).
+# e.g. ROUTING_MODEL=groq/qwen/qwen3-32b  Leave blank to use keyword-only routing.
+ROUTING_MODEL = os.getenv("ROUTING_MODEL", "")
 
 # ReAct loop addenda — appended to system prompt for interactive vs. agent contexts.
 # Callers pass these via system_addendum= to run_react_loop().
@@ -243,8 +273,8 @@ _REACT_PATTERNS = (
 )
 
 
-def classify_execution_mode(message: str) -> str:
-    """Return 'rewoo', 'react', or 'single' based on the message's execution pattern.
+def _keyword_classify(message: str) -> str:
+    """Keyword-based fallback: return 'rewoo', 'react', or 'single'.
 
     Priority order:
       1. Strong ReWOO — explicit sequential save/create/update (beats everything)
@@ -266,6 +296,28 @@ def classify_execution_mode(message: str) -> str:
     if any(re.search(p, msg) for p in _REWOO_PATTERNS_PIPELINE):
         return "rewoo"
     return "single"
+
+
+# Sync alias — used by eval scripts and non-async callers
+classify_execution_mode = _keyword_classify
+
+
+async def classify_execution_mode_async(message: str) -> str:
+    """Async execution mode classifier: tries LLM router first, falls back to keywords.
+
+    When ROUTING_MODEL is set, makes a single cheap LLM call for classification.
+    On failure or when ROUTING_MODEL is unset, falls back to keyword heuristics.
+    """
+    if ROUTING_MODEL:
+        try:
+            from router import classify as llm_classify
+            result = await llm_classify(message)
+            if result:
+                return result
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("LLM router import/call failed, using keywords", exc_info=True)
+    return _keyword_classify(message)
 
 
 
@@ -350,25 +402,29 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
 
     messages = prune_tool_results(messages)
 
+    used_model = model or DEFAULT_MODEL
+    api_url, api_headers, resolved_model, extra_payload = _resolve_endpoint(used_model)
+
     payload = {
-        "model": model or DEFAULT_MODEL,
+        "model": resolved_model,
         "messages": messages,
+        **extra_payload,
     }
     if use_tools:
         payload["tools"] = tools_override if tools_override is not None else (_get_schemas() if _get_schemas else [])
         payload["tool_choice"] = "auto"
 
-    _headers = {"Authorization": f"Bearer {_API_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await _post_with_retry(client, _API_URL, _headers, payload)
+        response = await _post_with_retry(client, api_url, api_headers, payload)
         if response.status_code >= 400:
-            used_model = model or DEFAULT_MODEL
             if FALLBACK_MODEL and used_model != FALLBACK_MODEL:
-                payload["model"] = FALLBACK_MODEL
-                response = await _post_with_retry(client, _API_URL, _headers, payload)
+                fb_url, fb_headers, fb_model, fb_extra = _resolve_endpoint(FALLBACK_MODEL)
+                payload["model"] = fb_model
+                payload.update(fb_extra)
+                response = await _post_with_retry(client, fb_url, fb_headers, payload)
             if response.status_code >= 400:
                 raise httpx.HTTPStatusError(
-                    f"OpenRouter {response.status_code}: {response.text}",
+                    f"LLM {response.status_code}: {response.text}",
                     request=response.request,
                     response=response,
                 )
