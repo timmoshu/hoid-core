@@ -632,6 +632,35 @@ async def run_single_pass(message: str, model: str, history: list = None, tools_
 MAX_AGENT_TURNS = 6
 
 
+def _try_parse_text_tool_call(text: str) -> tuple[str, dict] | None:
+    """Detect when a model outputs a JSON tool call as text instead of using tool_calls.
+
+    Returns (tool_name, args_dict) if detected, else None.
+    Looks for patterns like: {"name": "capture_note", "args": {...}}
+    """
+    stripped = text.strip()
+    # Must look like JSON
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        # Try extracting JSON from surrounding text
+        m = re.search(r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*\}[^}]*\}', stripped)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group())
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    name = data.get("name")
+    args = data.get("args")
+    if isinstance(name, str) and isinstance(args, dict):
+        return name, args
+    return None
+
+
 async def run_react_loop(message: str, model: str, history: list = None, tools_override: list = None, system_addendum: str = None) -> dict:
     """ReAct agent loop: iterative tool use until task complete or MAX_AGENT_TURNS.
 
@@ -656,6 +685,23 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
     for _ in range(MAX_AGENT_TURNS):
         if result["type"] == "text":
             content = result["content"]
+
+            # Recovery 0: model output a JSON tool call as text instead of using
+            # the tool calling mechanism (common with some models in ReAct loops).
+            # Parse it and dispatch if it looks like {"name": "...", "args": {...}}.
+            parsed_call = _try_parse_text_tool_call(content)
+            if parsed_call and _dispatch:
+                call_name, call_args = parsed_call
+                tr_content = await _dispatch(call_name, call_args)
+                tr_content = _cap_tool_result(tr_content)
+                all_tools.append(call_name)
+                # Build accumulated context and continue the loop
+                synth_messages = (accumulated or result.get("_messages", [])) + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": f"Tool {call_name} returned:\n{tr_content}\n\nPlease provide a natural language response based on this result."},
+                ]
+                result = await chat(messages=synth_messages, model=model, tools_override=tools_override)
+                continue
 
             # Recovery 1: model returned empty text without calling any real tool — nudge it
             if not content.strip() and not all_tools and not _nudged:
