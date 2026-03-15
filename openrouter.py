@@ -219,7 +219,7 @@ _REACT_SUBSTRINGS = (
     "mtd", "month to date", "month-to-date",
     "since january", "since the start of the year",
     "past month", "past week", "past year",
-    "this month", "this year",
+    "this week", "last week", "this month", "this year",
     "over the past", "over the last",
 )
 _REACT_PATTERNS = (
