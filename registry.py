@@ -3,31 +3,15 @@
 Provides: register(), get_schemas(), dispatch(), execute_plan().
 Each consumer registers its own tools at startup. This file has ZERO
 tool registrations — it's a framework only.
+
+Consumers should define their own claims_tool_action() in their
+tools/registry.py to detect hallucinated actions specific to their
+tool set. The default here is a no-op.
 """
 import asyncio
 import inspect
-import re
 
 _registry: dict[str, dict] = {}
-
-# Matches text that claims a tool action was performed — used to detect hallucinated
-# actions when the model returns text without actually making a tool call.
-_HALLUCINATED_ACTION_RE = re.compile(
-    r"\b(?:saved|captured|stored|added|jotted|saving|capturing|storing|adding"
-    r"|updated|enriched|filled in?|set)"
-    r".{0,60}"
-    r"\b(?:obsidian|vault|inbox|todo|task.?list|memory|task|tasks)\b",
-    re.IGNORECASE | re.DOTALL
-)
-
-# Bare one-word confirmations, or "Added/Updated: [title] —" synthesis format the model
-# mimics when hallucinating a todo action without actually calling a tool.
-_BARE_DONE_RE = re.compile(
-    r"^(?:done|updated|enriched)[.!]?$"
-    r"|^Added:\s.+\s—\s"
-    r"|^Updated:\s.+\s—\s",
-    re.IGNORECASE | re.DOTALL
-)
 
 TOOL_TIMEOUT = 60  # seconds; per-tool ceiling, leaves headroom for synthesis call
 
@@ -69,11 +53,13 @@ def get_handler(name: str):
 
 
 def claims_tool_action(text: str) -> bool:
-    """True if a text-only response claims to have performed a tool action."""
-    stripped = text.strip()
-    if _BARE_DONE_RE.match(stripped):
-        return True
-    return bool(_HALLUCINATED_ACTION_RE.search(stripped))
+    """True if a text-only response claims to have performed a tool action.
+
+    Default is a no-op. Each consumer should define their own version in
+    their tools/registry.py with patterns specific to their tool set.
+    init() in openrouter.py picks it up via getattr().
+    """
+    return False
 
 
 def is_dispatch_error(result: str) -> bool:
@@ -105,15 +91,23 @@ async def dispatch(name: str, args: dict) -> str:
 async def execute_plan(plan: list[dict]) -> list[dict]:
     """Execute a ReWOO plan sequentially, substituting #E placeholders with prior results."""
     evidences: dict[str, str] = {}
+    failed_vars: set[str] = set()
     results = []
     for step in plan:
         resolved_args = {}
         for key, val in step.get("args", {}).items():
             if isinstance(val, str):
                 for var, evidence in evidences.items():
-                    val = val.replace(var, evidence)
+                    # Skip substitution for failed steps — prevents error strings
+                    # from corrupting downstream args
+                    if var not in failed_vars:
+                        val = val.replace(var, evidence)
             resolved_args[key] = val
         result = await dispatch(step["tool"], resolved_args)
         evidences[step["var"]] = result
+        if result.startswith("Unknown tool:") or (
+            result.startswith("Tool '") and ("failed:" in result or "timed out" in result)
+        ):
+            failed_vars.add(step["var"])
         results.append({"var": step["var"], "tool": step["tool"], "content": result})
     return results

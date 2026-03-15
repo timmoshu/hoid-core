@@ -91,7 +91,7 @@ async def fetch_url(url: str) -> str:
             async with httpx.AsyncClient(
                 timeout=20,
                 follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; Hoid/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; hoid-core/1.0)"},
             ) as client:
                 r = await client.get(url)
             if r.status_code == 403:
