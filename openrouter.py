@@ -71,7 +71,8 @@ REACT_ADDENDUM_AGENT = (
     "- After 5 tool calls without a complete answer, stop and report what you found so far.\n"
     "- Your final answer must directly address the request and nothing else. No unsolicited context, caveats, or padding.\n"
     "- Never expose your internal process in the final answer. Do not include tool call parameters, search queries, "
-    "chain-of-thought reasoning, or \"I searched for X\" narration. Present only polished results."
+    "chain-of-thought reasoning, or \"I searched for X\" narration. Present only polished results.\n"
+    "- NEVER output tool calls as JSON text. Always use the tool calling mechanism provided. Your text responses must be natural language only."
 )
 
 REACT_ADDENDUM_CHAT = (
@@ -82,7 +83,8 @@ REACT_ADDENDUM_CHAT = (
     "- After each tool call, briefly validate whether the result answered the question; if not, make at most one additional targeted tool call when necessary.\n"
     "- Keep responses concise; this is an interactive chat session, not a report.\n"
     "- Stop once the question is answered. Do not make additional tool calls after you have a satisfactory answer.\n"
-    "- Reason internally as needed, but do not reveal private chain-of-thought unless explicitly requested."
+    "- Reason internally as needed, but do not reveal private chain-of-thought unless explicitly requested.\n"
+    "- NEVER output tool calls as JSON text. Always use the tool calling mechanism provided. Your text responses must be natural language only."
 )
 
 # Token usage accumulator — reset by run_single_pass()/run_react_loop() at
