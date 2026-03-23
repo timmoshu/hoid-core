@@ -1,8 +1,8 @@
 """OpenRouter LLM client — shared engine for hoid and vespyn.
 
-Provides: chat(), plan_chat(), run_single_pass(), run_react_loop(),
+Provides: chat(), run_react_loop(),
           synthesize_tool_result(), synthesize_plan_result(),
-          route_model(), classify_execution_mode(), prune_tool_results()
+          prune_tool_results()
 
 Dependencies are injected via init() at startup — each consumer provides
 its own registry and context loader. Call init() before first use.
@@ -36,6 +36,37 @@ if _groq_key:
         {"reasoning_format": "hidden"},
     )
 
+_gemini_key = os.getenv("GEMINI_API_KEY", "")
+if _gemini_key:
+    _ALT_BACKENDS["google/"] = (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        _gemini_key,
+        {},
+    )
+
+_anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+if _anthropic_key:
+    # "ant/" prefix routes directly to Anthropic's OpenAI-compatible endpoint.
+    # Saves OpenRouter's 5% markup + reduces latency (one fewer hop).
+    # Docs: https://platform.claude.com/docs/en/api/openai-sdk
+    _ALT_BACKENDS["ant/"] = (
+        "https://api.anthropic.com/v1/chat/completions",
+        _anthropic_key,
+        {},
+    )
+
+_openai_key = os.getenv("OPENAI_API_KEY", "")
+if _openai_key:
+    # "oai/" prefix routes directly to OpenAI API, bypassing OpenRouter.
+    # Use "openai/" prefix (no alt backend) for OpenRouter-hosted OpenAI models
+    # like openai/gpt-oss-120b that don't exist on OpenAI's own API.
+    _ALT_BACKENDS["oai/"] = (
+        "https://api.openai.com/v1/chat/completions",
+        _openai_key,
+        {},
+    )
+
+
 
 def _resolve_endpoint(model: str) -> tuple[str, dict, str, dict]:
     """Return (api_url, headers, model_id, extra_payload) for the given model.
@@ -57,10 +88,10 @@ NOTES_MODEL = os.getenv("NOTES_MODEL", DEFAULT_MODEL)
 SUMMARIZATION_MODEL = os.getenv("SUMMARIZATION_MODEL", DEFAULT_MODEL)
 COMPLEX_MODEL = os.getenv("COMPLEX_MODEL", SUMMARIZATION_MODEL)
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "")
-# ROUTING_MODEL: cheap/fast model for LLM-based execution mode classification (router.py).
-# Groq-prefixed models route directly to Groq API (requires GROQ_API_KEY).
-# e.g. ROUTING_MODEL=groq/qwen/qwen3-32b  Leave blank to use keyword-only routing.
-ROUTING_MODEL = os.getenv("ROUTING_MODEL", "")
+CHAT_MODEL = os.getenv("CHAT_MODEL", COMPLEX_MODEL)
+WORKER_MODEL = os.getenv("WORKER_MODEL", "google/gemini-3.1-flash-lite")
+PLANNER_MODEL = os.getenv("PLANNER_MODEL", "anthropic/claude-sonnet-4-6")
+SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", SUMMARIZATION_MODEL)
 
 # ReAct loop addenda — appended to system prompt for interactive vs. agent contexts.
 # Callers pass these via system_addendum= to run_react_loop().
@@ -87,8 +118,8 @@ REACT_ADDENDUM_CHAT = (
     "- NEVER output tool calls as JSON text. Always use the tool calling mechanism provided. Your text responses must be natural language only."
 )
 
-# Token usage accumulator — reset by run_single_pass()/run_react_loop() at
-# entry, incremented by chat() and synthesize_tool_result() on each API call.
+# Token usage accumulator — reset by run_react_loop() at entry,
+# incremented by chat() and synthesize_tool_result() on each API call.
 # Safe in asyncio single-threaded context (no concurrent top-level calls).
 _request_tokens = 0
 
@@ -133,9 +164,10 @@ _is_dispatch_error = None    # (result: str) -> bool
 _claims_tool_action = None   # (text: str) -> bool
 _load_context = None         # () -> str
 _synthesis_shortcircuit = None  # (tool_results: list) -> str | None
+_run_worker = None           # (tool_name: str, task: str, *, user_intent: str) -> WorkerResult
 
 
-def init(*, registry=None, context_loader=None, synthesis_shortcircuit=None):
+def init(*, registry=None, context_loader=None, synthesis_shortcircuit=None, worker=None):
     """Inject dependencies. Call once at startup before any chat/dispatch calls.
 
     registry:       module with get_schemas(), dispatch(), is_dispatch_error(),
@@ -145,7 +177,7 @@ def init(*, registry=None, context_loader=None, synthesis_shortcircuit=None):
                     a string, synthesize_tool_result() returns it immediately
                     instead of making a synthesis API call
     """
-    global _get_schemas, _dispatch, _is_dispatch_error, _claims_tool_action, _load_context, _synthesis_shortcircuit
+    global _get_schemas, _dispatch, _is_dispatch_error, _claims_tool_action, _load_context, _synthesis_shortcircuit, _run_worker
     if registry is not None:
         _get_schemas = registry.get_schemas
         _dispatch = registry.dispatch
@@ -155,172 +187,8 @@ def init(*, registry=None, context_loader=None, synthesis_shortcircuit=None):
         _load_context = context_loader
     if synthesis_shortcircuit is not None:
         _synthesis_shortcircuit = synthesis_shortcircuit
-
-
-# ---------------------------------------------------------------------------
-# Model routing
-# ---------------------------------------------------------------------------
-
-# Signals that indicate a reasoning-heavy request deserving COMPLEX_MODEL.
-# Score ONLY the user message — never the system prompt.
-_COMPLEXITY_SIGNALS = (
-    "analyze", "analysis", "compare", "comparison", "synthesize",
-    "think through", "help me think", "help me understand", "explain why",
-    "what should i", "should i", "recommend", "recommendation",
-    "strategy", "pros and cons", "tradeoff", "trade-off",
-    "decide", "decision", "weigh", "consider my options",
-    "this week", "last week", "what have i", "what did i accomplish",
-    "review my", "walk me through", "step by step",
-)
-_COMPLEX_WORD_THRESHOLD = 80  # messages longer than this get a complexity bump
-
-
-def route_model(message: str) -> str:
-    """Return the appropriate model tier for a user message.
-
-    Scores only the user message (not the system prompt) to avoid
-    inflating every request to the expensive tier.
-    """
-    lower = message.lower()
-    if len(message.split()) > _COMPLEX_WORD_THRESHOLD:
-        return COMPLEX_MODEL
-    if any(s in lower for s in _COMPLEXITY_SIGNALS):
-        return COMPLEX_MODEL
-    return DEFAULT_MODEL
-
-
-# Signals that indicate a multi-step request requiring sequential execution.
-# Strong ReWOO: explicit sequential save/write/create — always beats react.
-_REWOO_SUBSTRINGS_STRONG = (
-    "and then",
-    "then save", "then add", "then update", "then send", "then note", "then create",
-    "and save", "and note", "and capture",
-    "and add a todo", "and add to my", "and create a todo", "and put it",
-)
-_REWOO_PATTERNS_STRONG = (
-    r"first\b.{1,60}\bthen\b",
-    r"research.{1,60}and (save|add|note|capture)",
-    r"look up.{1,60}and (save|add|note)",
-    r"find.{1,60}and (add|note|save)",
-)
-
-# Pipeline ReWOO: multi-source sequential fetch — beats single but yields to react ("for each").
-_REWOO_SUBSTRINGS_PIPELINE = (
-    "then search", "then fetch", "then look", "then check", "then email",
-)
-_REWOO_PATTERNS_PIPELINE = (
-    r"(read|fetch|get|search|check).{1,80},\s*then\b",
-)
-
-
-# Signals that indicate iterative/conditional execution — operates over unknown data at runtime.
-_REACT_SUBSTRINGS = (
-    # Bulk operations on an unknown-sized set
-    "review all", "go through all", "go through my",
-    "check all", "enrich all", "update all my", "fill in all",
-    "for each",
-    # Iteration over search/vault/web results
-    "each result", "each article",
-    "go through each",  # "go through each search result", "go through each note"
-    "look up each",     # "look up each competitor"
-    "fetch each",       # "fetch each of these URLs"
-    "read each",        # "read each article and pull the key points"
-    # Conditional/investigative — step 2 depends on evaluating step 1
-    "investigate", "figure out",
-    "if that fails", "if that doesn't work", "if there's nothing",
-    "try different", "depends on", "depending on",
-    # Scan-then-select: fetch a list/feed, evaluate what came back, drill in
-    # These imply the agent can't know which items to act on until it sees the data.
-    "most interesting", "most relevant", "most important",
-    "worth reading", "worth noting", "worth knowing",
-    "stand out", "stands out",
-    "anything interesting", "anything notable", "anything worth",
-    "anything relevant", "anything important",
-    "relevant posts", "relevant articles", "relevant results",
-    "notable posts", "notable articles",
-    "if there are any", "if there's anything", "if anything is",
-    "scan for", "monitor for", "watch for", "look for any", "filter for",
-    "pick the best", "pick the top", "pick the most",
-    "select the best", "select the most relevant",
-    "if the odds", "if the score", "if the price", "if the result",
-    "compare sources", "cross-reference",
-    "follow up", "follow-up",
-    "based on the results", "based on what",
-    # Market period queries — need web_search or run_code_task, not fetch_market_data
-    "ytd", "year to date", "year-to-date",
-    "mtd", "month to date", "month-to-date",
-    "since january", "since the start of the year",
-    "past month", "past week", "past year",
-    "this week", "last week", "this month", "this year",
-    "over the past", "over the last",
-)
-_REACT_PATTERNS = (
-    # Todo-specific bulk patterns
-    r"review (all|each|my) (task|todo)",
-    r"(all|each) (task|todo).{0,30}(enrich|fill|update|add)",
-    r"enrich (all|my|each).{0,10}(task|todo)",        # "enrich my todos" — primary use case
-    r"fill in.{0,25}(all|my|each).{0,10}(task|todo)", # "fill in descriptions for my tasks"
-    # Research/vault iteration
-    r"find all.{0,25}(note|article|result)",           # "find all my notes on X"
-    r"(search|look|research).{1,40}(multiple|several)", # "search multiple angles"
-    r"try .{1,40}(if|when).{1,40}(fail|doesn.t work|nothing)",
-    # Scan-then-select patterns (new tools: reddit, predictions, sports, crypto)
-    r"(most|top).{1,20}(interesting|relevant|important|notable|noteworthy)",
-    r"anything (interesting|notable|important|relevant|worth)",
-    r"(monitor|watch|scan|look).{1,60}(for any|for relevant|for mentions|for posts|for threads)",
-    r"(filter|select|pick).{1,40}(relevant|interesting|best|top|most)",
-    r"if (there are|there.?s|any).{1,40}(relevant|interesting|notable|worth)",
-    r"(summarize|highlight|pull out).{1,40}(best|top|most|relevant|notable|interesting)",
-    r"(check|see).{1,60}(if (there|any|it)).{1,40}(interest|notabl|worth|relevant)",
-)
-
-
-def _keyword_classify(message: str) -> str:
-    """Keyword-based fallback: return 'rewoo', 'react', or 'single'.
-
-    Priority order:
-      1. Strong ReWOO — explicit sequential save/create/update (beats everything)
-      2. ReAct — iterative over unknown data ("for each", scan-then-select, bulk ops)
-      3. Pipeline ReWOO — multi-source sequential (only when no react signal)
-      4. Single — everything else
-    """
-    msg = message.lower()
-    if any(s in msg for s in _REWOO_SUBSTRINGS_STRONG):
-        return "rewoo"
-    if any(re.search(p, msg) for p in _REWOO_PATTERNS_STRONG):
-        return "rewoo"
-    if any(s in msg for s in _REACT_SUBSTRINGS):
-        return "react"
-    if any(re.search(p, msg) for p in _REACT_PATTERNS):
-        return "react"
-    if any(s in msg for s in _REWOO_SUBSTRINGS_PIPELINE):
-        return "rewoo"
-    if any(re.search(p, msg) for p in _REWOO_PATTERNS_PIPELINE):
-        return "rewoo"
-    return "single"
-
-
-# Sync alias — used by eval scripts and non-async callers
-classify_execution_mode = _keyword_classify
-
-
-async def classify_execution_mode_async(message: str) -> str:
-    """Async execution mode classifier: tries LLM router first, falls back to keywords.
-
-    When ROUTING_MODEL is set, makes a single cheap LLM call for classification.
-    On failure or when ROUTING_MODEL is unset, falls back to keyword heuristics.
-    """
-    if ROUTING_MODEL:
-        try:
-            from router import classify as llm_classify
-            result = await llm_classify(message)
-            if result:
-                return result
-        except Exception:
-            import logging
-            logging.getLogger(__name__).warning("LLM router import/call failed, using keywords", exc_info=True)
-    return _keyword_classify(message)
-
+    if worker is not None:
+        _run_worker = worker
 
 
 def prune_tool_results(messages: list, keep_last: int = 3) -> list:
@@ -375,7 +243,7 @@ def prune_tool_results(messages: list, keep_last: int = 3) -> list:
 # Core chat
 # ---------------------------------------------------------------------------
 
-async def chat(message: str = None, system: str = None, use_tools: bool = True, history: list = None, model: str = None, messages: list = None, tools_override: list = None, system_addendum: str = None) -> dict:
+async def chat(message: str = None, system: str = None, use_tools: bool = True, history: list = None, model: str = None, messages: list = None, tools_override: list = None, system_addendum: str = None, json_mode: bool = False) -> dict:
     """Call OpenRouter and return either a text response or a tool call.
 
     Returns:
@@ -412,11 +280,17 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
         "messages": messages,
         **extra_payload,
     }
+    if json_mode:
+        # Anthropic's OpenAI-compatible endpoint doesn't support json_object mode —
+        # only json_schema with a full schema. Skip response_format for ant/ models;
+        # the system prompt already instructs JSON output.
+        if not (used_model and used_model.startswith("ant/")):
+            payload["response_format"] = {"type": "json_object"}
     if use_tools:
         payload["tools"] = tools_override if tools_override is not None else (_get_schemas() if _get_schemas else [])
         payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         response = await _post_with_retry(client, api_url, api_headers, payload)
         if response.status_code >= 400:
             if FALLBACK_MODEL and used_model != FALLBACK_MODEL:
@@ -521,7 +395,7 @@ async def synthesize_tool_result(
     # Synthesis uses SUMMARIZATION_MODEL for better prose than DEFAULT_MODEL.
     payload = {"model": SUMMARIZATION_MODEL, "messages": follow_up}
     _headers = {"Authorization": f"Bearer {_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         resp = await _post_with_retry(client, _API_URL, _headers, payload)
         if resp.status_code >= 400:
             raise httpx.HTTPStatusError(
@@ -537,98 +411,6 @@ async def synthesize_tool_result(
     if not content:
         content = "\n".join(r["content"] for r in tool_results)
     return content
-
-
-async def plan_chat(message: str, history: list, model: str, tools_override: list = None) -> list[dict]:
-    """Generate a ReWOO execution plan: list of {var, tool, args} steps.
-
-    Uses COMPLEX_MODEL with a custom planning system prompt (no persona context needed).
-    Raises json.JSONDecodeError if the model returns unparseable output — caller falls back.
-    """
-    schemas = tools_override if tools_override is not None else (_get_schemas() if _get_schemas else [])
-    schemas_json = json.dumps(schemas, indent=2)
-    planning_system = f"""You are a task planner. Given the user's request, output a JSON array of steps.
-
-Available tools:
-{schemas_json}
-
-Rules:
-- Each step: {{"var": "#E1", "tool": "tool_name", "args": {{...}}}}
-- Number steps #E1, #E2, etc.
-- Use placeholder values in args when a step needs a prior step's output (e.g. "content": "#E1")
-- Output ONLY a valid JSON array. No explanation, no markdown."""
-
-    result = await chat(message, system=planning_system, use_tools=False,
-                        history=history, model=model)
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", result["content"].strip(), flags=re.DOTALL)
-    return json.loads(raw)
-
-
-async def run_single_pass(message: str, model: str, history: list = None, tools_override: list = None) -> dict:
-    """Run single-pass chat: dispatch, escalation, synthesis.
-
-    Returns:
-        {"type": "reply", "content": str, "tools": list, "tokens_used": int}
-        {"type": "disambig", "matches": list, "tokens_used": int}
-    """
-    global _request_tokens
-    _request_tokens = 0
-
-    async def _run_call(call: dict) -> dict:
-        content = await _dispatch(call["name"], call["args"])
-        return {"id": call["id"], "name": call["name"], "content": content}
-
-    async def _safe_synthesize(messages, assistant_msg, tool_results):
-        try:
-            return await synthesize_tool_result(messages, assistant_msg, tool_results)
-        except Exception:
-            return "\n".join(r["content"] for r in tool_results)
-
-    _is_err = _is_dispatch_error or (lambda r: False)
-    _claims = _claims_tool_action or (lambda t: False)
-
-    result = await chat(message, history=history or [], model=model, tools_override=tools_override)
-
-    if result["type"] == "tool_call":
-        tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
-
-        # Check for disambiguation sentinel before escalation/synthesis
-        for tr in tool_results:
-            if tr["content"].startswith("__DISAMBIG__|"):
-                payload = json.loads(tr["content"].split("|", 1)[1])
-                return {
-                    "type": "disambig",
-                    "matches": payload["matches"],
-                    "action": payload.get("action", "done"),
-                    "params": payload.get("params", {}),
-                    "tools": [c["name"] for c in result["calls"]],
-                    "tokens_used": _request_tokens,
-                }
-
-        # Escalate: if DEFAULT_MODEL produced a tool error, retry on COMPLEX_MODEL
-        if model == DEFAULT_MODEL and any(_is_err(tr["content"]) for tr in tool_results):
-            result = await chat(message, history=history or [], model=COMPLEX_MODEL, tools_override=tools_override)
-            if result["type"] == "tool_call":
-                tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
-                content = await _safe_synthesize(result["_messages"], result["_assistant_msg"], tool_results)
-            else:
-                content = result["content"]
-            return {"type": "reply", "content": content, "tools": [c["name"] for c in result.get("calls", [])], "tokens_used": _request_tokens}
-
-        content = await _safe_synthesize(result["_messages"], result["_assistant_msg"], tool_results)
-        return {"type": "reply", "content": content, "tools": [c["name"] for c in result["calls"]], "tokens_used": _request_tokens}
-
-    # Text response — escalate if DEFAULT_MODEL claimed a tool action without calling one
-    if model == DEFAULT_MODEL and _claims(result["content"]):
-        result = await chat(message, history=history or [], model=COMPLEX_MODEL, tools_override=tools_override)
-        if result["type"] == "tool_call":
-            tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
-            content = await _safe_synthesize(result["_messages"], result["_assistant_msg"], tool_results)
-        else:
-            content = result["content"]
-        return {"type": "reply", "content": content, "tools": [c["name"] for c in result.get("calls", [])], "tokens_used": _request_tokens}
-
-    return {"type": "reply", "content": result["content"], "tools": [], "tokens_used": _request_tokens}
 
 
 MAX_AGENT_TURNS = 6
@@ -663,11 +445,13 @@ def _try_parse_text_tool_call(text: str) -> tuple[str, dict] | None:
     return None
 
 
-async def run_react_loop(message: str, model: str, history: list = None, tools_override: list = None, system_addendum: str = None) -> dict:
+async def run_react_loop(message: str, model: str, history: list = None, tools_override: list = None, system_addendum: str = None, user_intent: str = None) -> dict:
     """ReAct agent loop: iterative tool use until task complete or MAX_AGENT_TURNS.
 
-    Always uses the provided model (caller should pass COMPLEX_MODEL).
-    Returns same shape as run_single_pass():
+    When user_intent is provided and a worker is configured, tool calls are
+    dispatched through scoped workers instead of direct dispatch.
+
+    Returns:
         {"type": "reply", "content": str, "tools": list, "tokens_used": int}
         {"type": "disambig", ..., "tokens_used": int}
     """
@@ -726,11 +510,35 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
 
             return {"type": "reply", "content": content, "tools": all_tools, "tokens_used": _request_tokens}
 
-        # Dispatch all tool calls for this turn concurrently
-        tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
         all_tools.extend(c["name"] for c in result["calls"])
 
-        # Surface disambiguation sentinel immediately — can't show buttons from inside a loop
+        if user_intent and _run_worker:
+            # Worker dispatch path: each tool call → scoped worker
+            async def _dispatch_worker(i, call):
+                return await _run_worker(
+                    call["name"],
+                    call["args"].get("task", json.dumps(call["args"])),
+                    user_intent=user_intent,
+                )
+
+            worker_results = list(
+                await asyncio.gather(*[_dispatch_worker(i, c) for i, c in enumerate(result["calls"])])
+            )
+
+            # Build tool results from worker outputs
+            tool_results = [
+                {
+                    "id": result["calls"][i]["id"],
+                    "name": result["calls"][i]["name"],
+                    "content": wr.output if wr.success else f"[Worker error: {wr.error}]",
+                }
+                for i, wr in enumerate(worker_results)
+            ]
+        else:
+            # Direct dispatch path (no workers)
+            tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
+
+        # Surface disambiguation sentinel immediately
         for tr in tool_results:
             if tr["content"].startswith("__DISAMBIG__|"):
                 payload = json.loads(tr["content"].split("|", 1)[1])
@@ -739,6 +547,16 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                     "matches": payload["matches"],
                     "action": payload.get("action", "done"),
                     "params": payload.get("params", {}),
+                    "tools": all_tools,
+                    "tokens_used": _request_tokens,
+                }
+
+        # Surface sandbox shortcircuit
+        for tr in tool_results:
+            if tr["content"].startswith("Working on it"):
+                return {
+                    "type": "reply",
+                    "content": tr["content"],
                     "tools": all_tools,
                     "tokens_used": _request_tokens,
                 }
@@ -758,7 +576,7 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                 "role": "tool",
                 "tool_call_id": id_map[r["id"]],
                 "name": r["name"],
-                "content": str(r["content"]),
+                "content": _cap_tool_result(str(r["content"])),
             }
             for r in tool_results
         ]
