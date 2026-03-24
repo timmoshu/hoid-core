@@ -538,12 +538,20 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
         all_tools.extend(c["name"] for c in result["calls"])
 
         if user_intent and _run_worker:
+            # Extract prior tool results for context-hungry tools (e.g. run_code_task)
+            _prior_context = []
+            if accumulated:
+                for m in accumulated:
+                    if m.get("role") == "tool" and m.get("content"):
+                        _prior_context.append({"tool": m.get("name", ""), "content": m["content"][:2000]})
+
             # Worker dispatch path: each tool call → scoped worker
             async def _dispatch_worker(i, call):
                 return await _run_worker(
                     call["name"],
                     call["args"].get("task", json.dumps(call["args"])),
                     user_intent=user_intent,
+                    prior_context=_prior_context or None,
                 )
 
             worker_results = list(
