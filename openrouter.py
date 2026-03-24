@@ -140,6 +140,15 @@ async def _post_with_retry(
     for attempt in range(_MAX_LLM_RETRIES):
         response = await client.post(url, headers=headers, json=payload)
         if response.status_code not in _RETRYABLE_STATUSES:
+            # Some providers return 200 with an error body and no choices
+            try:
+                body = response.json()
+                if "error" in body and "choices" not in body:
+                    if attempt < _MAX_LLM_RETRIES - 1:
+                        await asyncio.sleep(_LLM_RETRY_BASE * (2 ** attempt))
+                        continue
+            except (ValueError, KeyError):
+                pass
             return response
         if attempt < _MAX_LLM_RETRIES - 1:
             wait = _LLM_RETRY_BASE * (2 ** attempt)
@@ -314,10 +323,17 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
                     response=response,
                 )
 
-    msg = response.json()["choices"][0]["message"]
+    body = response.json()
+    if "choices" not in body or not body["choices"]:
+        raise httpx.HTTPStatusError(
+            f"LLM returned no choices: {response.text[:500]}",
+            request=response.request,
+            response=response,
+        )
+    msg = body["choices"][0]["message"]
 
     global _request_tokens
-    _request_tokens += response.json().get("usage", {}).get("total_tokens", 0)
+    _request_tokens += body.get("usage", {}).get("total_tokens", 0)
 
     if msg.get("tool_calls"):
         return {
@@ -551,7 +567,7 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
         for tr in tool_results:
             if tr["content"].startswith("__DISAMBIG__|"):
                 payload = json.loads(tr["content"].split("|", 1)[1])
-                return {
+                result = {
                     "type": "disambig",
                     "matches": payload["matches"],
                     "action": payload.get("action", "done"),
@@ -559,6 +575,11 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                     "tools": all_tools,
                     "tokens_used": _request_tokens,
                 }
+                # Forward extra keys (e.g. contact_files) for downstream handlers
+                for k in payload:
+                    if k not in ("matches", "action", "params"):
+                        result[k] = payload[k]
+                return result
 
         # Surface sandbox shortcircuit
         for tr in tool_results:
