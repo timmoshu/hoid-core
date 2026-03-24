@@ -293,7 +293,16 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
     async with httpx.AsyncClient(timeout=90) as client:
         response = await _post_with_retry(client, api_url, api_headers, payload)
         if response.status_code >= 400:
-            if FALLBACK_MODEL and used_model != FALLBACK_MODEL:
+            # If a direct backend failed, retry the same model via OpenRouter
+            _OR_PREFIX_MAP = {"oai/": "openai/", "ant/": "anthropic/", "groq/": ""}
+            matched_prefix = next((p for p in _ALT_BACKENDS if used_model and used_model.startswith(p)), None)
+            if matched_prefix:
+                or_model = _OR_PREFIX_MAP.get(matched_prefix, matched_prefix) + used_model[len(matched_prefix):]
+                or_headers = {"Authorization": f"Bearer {_API_KEY}", "Content-Type": "application/json"}
+                payload["model"] = or_model
+                payload.pop("reasoning_format", None)
+                response = await _post_with_retry(client, _API_URL, or_headers, payload)
+            if response.status_code >= 400 and FALLBACK_MODEL and used_model != FALLBACK_MODEL:
                 fb_url, fb_headers, fb_model, fb_extra = _resolve_endpoint(FALLBACK_MODEL)
                 payload["model"] = fb_model
                 payload.update(fb_extra)
