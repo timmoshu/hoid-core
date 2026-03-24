@@ -52,6 +52,14 @@ def get_handler(name: str):
     return entry["handler"] if entry else None
 
 
+def get_tool_timeout(name: str) -> int:
+    """Return the registered timeout for a tool, or TOOL_TIMEOUT as default."""
+    entry = _registry.get(name)
+    if entry:
+        return entry.get("timeout") or TOOL_TIMEOUT
+    return TOOL_TIMEOUT
+
+
 def claims_tool_action(text: str) -> bool:
     """True if a text-only response claims to have performed a tool action.
 
@@ -85,6 +93,26 @@ async def dispatch(name: str, args: dict) -> str:
         return f"Tool '{name}' timed out after {timeout}s."
     except Exception as e:
         return f"Tool '{name}' failed: {e}"
+    return result
+
+
+def _is_transient_error(result: str) -> bool:
+    """True if a dispatch result looks like a transient failure worth retrying.
+
+    Only matches error strings from dispatch() itself — never tool content.
+    dispatch() returns: "Tool 'X' timed out after Ns." or "Tool 'X' failed: ..."
+    """
+    if not (result.startswith("Tool '") or result.startswith("Unknown tool:")):
+        return False
+    return "timed out after" in result or "failed:" in result
+
+
+async def dispatch_with_retry(name: str, args: dict) -> str:
+    """Dispatch a tool call with a single retry on transient failures."""
+    result = await dispatch(name, args)
+    if _is_transient_error(result):
+        await asyncio.sleep(2)
+        result = await dispatch(name, args)
     return result
 
 
