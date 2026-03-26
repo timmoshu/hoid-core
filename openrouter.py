@@ -8,6 +8,7 @@ Dependencies are injected via init() at startup — each consumer provides
 its own registry and context loader. Call init() before first use.
 """
 import asyncio
+import logging
 import os
 import json
 import re
@@ -307,6 +308,10 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
             matched_prefix = next((p for p in _ALT_BACKENDS if used_model and used_model.startswith(p)), None)
             if matched_prefix:
                 or_model = _OR_PREFIX_MAP.get(matched_prefix, matched_prefix) + used_model[len(matched_prefix):]
+                logging.getLogger(__name__).warning(
+                    "Direct backend %s failed (%s): %s — falling back to OpenRouter as %s",
+                    used_model, response.status_code, response.text[:200], or_model,
+                )
                 or_headers = {"Authorization": f"Bearer {_API_KEY}", "Content-Type": "application/json"}
                 payload["model"] = or_model
                 payload.pop("reasoning_format", None)
