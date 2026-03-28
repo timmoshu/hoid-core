@@ -110,6 +110,7 @@ REACT_ADDENDUM_AGENT = (
 REACT_ADDENDUM_CHAT = (
     "- For conversational questions or topics answerable from existing knowledge, respond directly without making unnecessary tool calls.\n"
     "- For questions requiring current data, use the appropriate tool before answering. This includes topics such as prices, weather, news, scores, and market odds.\n"
+    "- For factual questions about real people, places, organizations, or events — especially ones you are not highly confident about — use web_search rather than risk fabricating details. A wrong confident answer is far worse than a quick search.\n"
     "- Before any significant tool call, state in one brief line the purpose of the call and the minimal inputs being used.\n"
     "- Use only the provided tools. If a needed tool is unavailable or returns no information, briefly say so and then offer the best available knowledge instead.\n"
     "- After each tool call, briefly validate whether the result answered the question; if not, make at most one additional targeted tool call when necessary.\n"
@@ -297,8 +298,10 @@ async def chat(message: str = None, system: str = None, use_tools: bool = True, 
         if not (used_model and used_model.startswith("ant/")):
             payload["response_format"] = {"type": "json_object"}
     if use_tools:
-        payload["tools"] = tools_override if tools_override is not None else (_get_schemas() if _get_schemas else [])
-        payload["tool_choice"] = "auto"
+        resolved_tools = tools_override if tools_override is not None else (_get_schemas() if _get_schemas else [])
+        if resolved_tools:
+            payload["tools"] = resolved_tools
+            payload["tool_choice"] = "auto"
 
     async with httpx.AsyncClient(timeout=90) as client:
         response = await _post_with_retry(client, api_url, api_headers, payload)
@@ -550,7 +553,20 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                     if m.get("role") == "tool" and m.get("content"):
                         _prior_context.append({"tool": m.get("name", ""), "content": m["content"][:2000]})
 
-            # Worker dispatch path: each tool call → scoped worker
+            # Meta-tools (like tool_search) bypass workers — dispatch directly
+            _META_TOOLS = {"tool_search"}
+            worker_calls = []
+            direct_calls = []
+            for i, call in enumerate(result["calls"]):
+                if call["name"] in _META_TOOLS:
+                    direct_calls.append((i, call))
+                else:
+                    worker_calls.append((i, call))
+
+            # Direct dispatch for meta-tools
+            direct_results = list(await asyncio.gather(*[_run_call(c) for _, c in direct_calls]))
+
+            # Worker dispatch for regular tools
             async def _dispatch_worker(i, call):
                 return await _run_worker(
                     call["name"],
@@ -559,19 +575,21 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                     prior_context=_prior_context or None,
                 )
 
-            worker_results = list(
-                await asyncio.gather(*[_dispatch_worker(i, c) for i, c in enumerate(result["calls"])])
-            )
+            worker_results_raw = list(
+                await asyncio.gather(*[_dispatch_worker(i, c) for i, c in worker_calls])
+            ) if worker_calls else []
 
-            # Build tool results from worker outputs
-            tool_results = [
-                {
-                    "id": result["calls"][i]["id"],
-                    "name": result["calls"][i]["name"],
+            # Merge results in original order
+            tool_results = [None] * len(result["calls"])
+            for idx, (i, _) in enumerate(direct_calls):
+                tool_results[i] = direct_results[idx]
+            for idx, (i, call) in enumerate(worker_calls):
+                wr = worker_results_raw[idx]
+                tool_results[i] = {
+                    "id": call["id"],
+                    "name": call["name"],
                     "content": wr.output if wr.success else f"[Worker error: {wr.error}]",
                 }
-                for i, wr in enumerate(worker_results)
-            ]
         else:
             # Direct dispatch path (no workers)
             tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
