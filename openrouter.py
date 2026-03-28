@@ -447,6 +447,7 @@ async def synthesize_tool_result(
 
 
 MAX_AGENT_TURNS = 6
+_META_TOOLS = {"tool_search"}
 
 
 def _try_parse_text_tool_call(text: str) -> tuple[str, dict] | None:
@@ -554,7 +555,6 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
                         _prior_context.append({"tool": m.get("name", ""), "content": m["content"][:2000]})
 
             # Meta-tools (like tool_search) bypass workers — dispatch directly
-            _META_TOOLS = {"tool_search"}
             worker_calls = []
             direct_calls = []
             for i, call in enumerate(result["calls"]):
@@ -593,6 +593,19 @@ async def run_react_loop(message: str, model: str, history: list = None, tools_o
         else:
             # Direct dispatch path (no workers)
             tool_results = list(await asyncio.gather(*[_run_call(c) for c in result["calls"]]))
+
+        # Expand tools_override with any schemas returned by tool_search
+        for tr in tool_results:
+            if tr and tr["name"] == "tool_search" and tr["content"]:
+                try:
+                    discovered = json.loads(tr["content"])
+                    if isinstance(discovered, list) and tools_override is not None:
+                        existing_names = {s["function"]["name"] for s in tools_override}
+                        for schema in discovered:
+                            if isinstance(schema, dict) and schema.get("function", {}).get("name") not in existing_names:
+                                tools_override.append(schema)
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
         # Surface disambiguation sentinel immediately
         for tr in tool_results:
