@@ -110,7 +110,7 @@ REACT_ADDENDUM_AGENT = (
 REACT_ADDENDUM_CHAT = (
     "- For conversational questions or topics answerable from existing knowledge, respond directly without making unnecessary tool calls.\n"
     "- For questions requiring current data, use the appropriate tool before answering. This includes topics such as prices, weather, news, scores, and market odds.\n"
-    "- For factual questions about real people, places, organizations, or events — especially ones you are not highly confident about — use web_search rather than risk fabricating details. A wrong confident answer is far worse than a quick search.\n"
+    "- For factual questions about real people, places, organizations, or events — search before answering. Start with search_wiki (compiled knowledge from articles and research the user has saved), then web_search if the wiki has no results or you need current information. A wrong confident answer is far worse than a quick search.\n"
     "- Before any significant tool call, state in one brief line the purpose of the call and the minimal inputs being used.\n"
     "- Use only the provided tools. If a needed tool is unavailable or returns no information, briefly say so and then offer the best available knowledge instead.\n"
     "- After each tool call, briefly validate whether the result answered the question; if not, make at most one additional targeted tool call when necessary.\n"
