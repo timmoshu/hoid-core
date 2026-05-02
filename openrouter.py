@@ -20,9 +20,13 @@ from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
 _ID_CHARS = string.ascii_letters + string.digits  # for Mistral tool call ID remapping
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-load_dotenv()
+# find_dotenv() walks up from the calling file's directory, not cwd. Since this
+# module lives outside the consumer's project (core/ vs hoid/), the default walk
+# never finds the project's .env. Use usecwd=True so we anchor on the process's
+# working directory — matches how all consumers actually invoke their scripts.
+load_dotenv(find_dotenv(usecwd=True))
 
 _API_KEY = os.getenv("OPENROUTER_API_KEY")
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
